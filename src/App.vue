@@ -1,277 +1,263 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { FUELS, STATIONS, type Fuel, type Station } from "./types";
+import { useDispatchStore, fmtTime } from "./store";
+import OrderCard from "./components/OrderCard.vue";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = useDispatchStore();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const filters = ["全部油站", ...STATIONS] as const;
+const filter = ref<(typeof filters)[number]>("全部油站");
 
-const project = {
-  "number": 19,
-  "folder": "hxwl/frontend/hxwlfront-19",
-  "framework": "vue",
-  "title": "油品配送计划",
-  "subtitle": "创建配送单并在待发车、运输中、已到站之间流转。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Element Plus"
-  ],
-  "storageKey": "hxwlfront-19-oil-delivery",
-  "formTitle": "创建配送单",
-  "primaryAction": "保存配送单",
-  "entityLabel": "配送单",
-  "statuses": [
-    "待发车",
-    "运输中",
-    "已到站"
-  ],
-  "filters": [
-    "全部油站",
-    "城东站",
-    "机场站",
-    "新区站"
-  ],
-  "fields": [
-    {
-      "key": "station",
-      "label": "目标油站",
-      "type": "select",
-      "options": [
-        "城东站",
-        "机场站",
-        "新区站"
-      ]
-    },
-    {
-      "key": "fuel",
-      "label": "油品",
-      "type": "select",
-      "options": [
-        "92号汽油",
-        "95号汽油",
-        "柴油"
-      ]
-    },
-    {
-      "key": "tons",
-      "label": "配送吨数",
-      "type": "number"
-    },
-    {
-      "key": "arriveAt",
-      "label": "计划到达",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "station": "城东站",
-      "fuel": "92号汽油",
-      "tons": 18,
-      "arriveAt": "2026-07-01",
-      "status": "运输中",
-      "notes": "车辆已出库"
-    },
-    {
-      "station": "机场站",
-      "fuel": "柴油",
-      "tons": 12,
-      "arriveAt": "2026-07-01",
-      "status": "待发车",
-      "notes": "等待装车"
-    }
-  ],
-  "metricLabels": [
-    "配送单",
-    "运输中",
-    "总吨数"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
-
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+const form = reactive({
+  station: "城东站" as Station,
+  fuel: "92号汽油" as Fuel,
+  tons: 10,
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
+const adjust = reactive<Record<string, number>>({});
+const adjustReason = ref("");
 
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
+const showLedger = ref(false);
 
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+function adjKey(station: string, fuel: string) {
+  return `${station}|${fuel}`;
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
+const visibleOrders = computed(() =>
+  filter.value === "全部油站" ? store.orders : store.orders.filter((o) => o.station === filter.value),
+);
+
+const metricCards = computed(() => [
+  { label: "配送单", value: store.orders.length },
+  { label: "待复核", value: store.pendingReviews.length, accent: store.pendingReviews.length > 0 },
+  { label: "库存缺口单", value: store.gapOrders.length, accent: store.gapOrders.length > 0 },
+  { label: "待回传领号", value: store.dirtyCount, accent: store.dirtyCount > 0 },
+]);
+
+const reviewKindLabel: Record<string, string> = {
+  车辆抢占: "车辆抢占",
+  装车差异: "装车差异",
+  验收待对: "验收待对",
+  半份恢复: "半份恢复",
+  油库调账: "油库调账",
+};
+
+function orderCode(id?: string) {
+  return store.orders.find((o) => o.id === id)?.code ?? "—";
 }
 
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function createOrder() {
+  if (!form.tons || form.tons <= 0) {
+    store.toast("error", "配送吨数需大于 0");
+    return;
+  }
+  store.createOrder({ station: form.station, fuel: form.fuel, tons: Number(form.tons) });
 }
 </script>
 
 <template>
   <main class="app">
     <div class="shell">
+      <!-- 顶部 -->
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">石油 · 汛期断网调运</p>
+          <h1>油品配送 · 领号续办调度台</h1>
+          <p class="subtitle">
+            配送单、油罐车、油站库存统一挂“领号”流水：断网可派车，回网按油库验收结果与平板待复核记录对账；
+            提交失败从最近完整领号恢复，已发车单据沿用首次确认依据；库存一变，未装车占用按新库存重算。
+          </p>
         </div>
-        <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+        <div class="conn-box">
+          <div class="net-state" :class="store.online ? 'on' : 'off'">
+            <span class="dot" />{{ store.online ? "在线（可回传）" : "断网（现场续办）" }}
+          </div>
+          <label class="switch">
+            <input type="checkbox" :checked="store.online" @change="store.setOnline(!store.online)" />
+            <span>切换网络</span>
+          </label>
+          <button class="primary big" @click="store.pullDepotAndReconcile()">
+            拉取油库验收结果并对账
+          </button>
+          <button class="ghost" @click="store.resetAll()">重置演示数据</button>
         </div>
       </header>
 
+      <!-- 指标 -->
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article v-for="m in metricCards" :key="m.label" class="metric" :class="{ hot: m.accent }">
+          <span>{{ m.label }}</span>
+          <strong>{{ m.value }}</strong>
         </article>
       </section>
 
-      <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
+      <div class="layout">
+        <!-- 左列：建单 + 库存 -->
+        <div class="col-left">
+          <form class="panel" @submit.prevent="createOrder">
+            <h2>新建配送单（先领号）</h2>
+            <label>目标油站
+              <select v-model="form.station">
+                <option v-for="s in STATIONS" :key="s" :value="s">{{ s }}</option>
               </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
             </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
+            <label>油品
+              <select v-model="form.fuel">
+                <option v-for="f in FUELS" :key="f" :value="f">{{ f }}</option>
+              </select>
             </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
+            <label>计划吨数
+              <input v-model.number="form.tons" type="number" min="1" step="0.5" />
+            </label>
+            <button class="primary" type="submit">领号建单</button>
+            <p class="hint">建单即产生“建单”领号；断网时进待回传队列，不影响继续操作。</p>
+          </form>
 
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
-          </div>
-
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
+          <section class="panel">
+            <h2>油库库存（验收权威数据）</h2>
+            <div class="inv-table">
+              <div class="inv-row inv-head">
+                <span>油站 / 油品</span>
+                <span v-for="f in FUELS" :key="f">{{ f }}</span>
               </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
+              <div v-for="row in store.inventoryRows" :key="row.station" class="inv-row">
+                <span class="inv-station">{{ row.station }}</span>
+                <div v-for="cell in row.cells" :key="cell.fuel" class="inv-cell">
+                  <p :class="{ neg: cell.free < 0 }">
+                    <strong>{{ cell.stock }}</strong> 吨
+                  </p>
+                  <p class="inv-sub">占用 {{ cell.reserved }} / 可拨 {{ cell.free }}</p>
+                  <div class="inv-adj">
+                    <input v-model.number="adjust[adjKey(row.station, cell.fuel)]" type="number" step="1" placeholder="±吨数" />
+                    <button
+                      @click="
+                        store.adjustStock(
+                          row.station as Station,
+                          cell.fuel as Fuel,
+                          Number(adjust[adjKey(row.station, cell.fuel)]) || 0,
+                          adjustReason,
+                        );
+                        adjust[adjKey(row.station, cell.fuel)] = undefined;
+                      "
+                    >
+                      调整
+                    </button>
+                  </div>
+                </div>
               </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
             </div>
+            <input v-model="adjustReason" class="reason-input" placeholder="调账原因（可选），如：油库补验收入库" />
+            <p class="hint">库存一变，所有“未装车”单据的占用与缺口立即按新库存重算。</p>
+          </section>
+        </div>
+
+        <!-- 右列：待复核 + 缺口 + 单据 -->
+        <div class="col-right">
+          <section class="panel review-panel">
+            <div class="panel-head">
+              <h2>平板待复核记录</h2>
+              <span class="count">{{ store.pendingReviews.length }} 笔待对账</span>
+            </div>
+            <div v-if="store.pendingReviews.length === 0" class="empty-line">暂无待复核，油库验收与平板记录一致。</div>
+            <div v-for="r in store.pendingReviews" :key="r.id" class="review pending">
+              <div class="review-main">
+                <span class="tag-kind" :data-kind="r.kind">{{ reviewKindLabel[r.kind] }}</span>
+                <div>
+                  <p class="review-msg">{{ r.message }}</p>
+                  <p class="review-sub">{{ orderCode(r.orderId) }} · {{ fmtTime(r.at) }}</p>
+                </div>
+              </div>
+              <div class="review-ops">
+                <button v-if="r.kind === '半份恢复'" class="warn" @click="store.recoverHalfLoad(r.id)">
+                  从最近完整领号恢复
+                </button>
+                <button class="secondary" @click="store.pullDepotAndReconcile()">拉取油库结果对账</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel gap-panel">
+            <div class="panel-head">
+              <h2>库存缺口清单</h2>
+              <span class="count">{{ store.gapOrders.length }} 单</span>
+            </div>
+            <div v-if="store.gapOrders.length === 0" class="empty-line">未装车需求均被库存覆盖，暂无缺口。</div>
+            <div v-for="o in store.gapOrders" :key="o.id" class="gap-row">
+              <span>{{ o.code }}</span>
+              <span>{{ o.station }} · {{ o.fuel }}</span>
+              <span>占用 {{ o.reservedTons }} 吨</span>
+              <strong class="gap-num">缺 {{ o.shortTons }} 吨</strong>
+            </div>
+          </section>
+
+          <section class="panel orders-panel">
+            <div class="panel-head">
+              <h2>配送单（领号续办）</h2>
+              <select v-model="filter" class="filter-select">
+                <option v-for="f in filters" :key="f" :value="f">{{ f }}</option>
+              </select>
+            </div>
+            <div v-if="visibleOrders.length === 0" class="empty-line">该油站暂无配送单。</div>
+            <OrderCard v-for="o in visibleOrders" :key="o.id" :order="o" />
+          </section>
+        </div>
+      </div>
+
+      <!-- 阶段分布 -->
+      <section class="panel chart-panel">
+        <h2>单据阶段分布</h2>
+        <div class="bar-row">
+          <div v-for="s in store.stageStats" :key="s.stage" class="bar-item">
+            <span class="bar-label">{{ s.stage }}</span>
+            <div class="bar-track">
+              <div class="bar-fill" :style="{ width: `${(s.value / Math.max(1, store.orders.length)) * 100}%` }" />
+            </div>
+            <strong>{{ s.value }}</strong>
           </div>
-        </section>
+        </div>
       </section>
+
+      <!-- 已对账记录 -->
+      <section v-if="store.resolvedReviews.length" class="panel">
+        <div class="panel-head">
+          <h2>已对账记录</h2>
+          <span class="count muted-count">{{ store.resolvedReviews.length }} 笔</span>
+        </div>
+        <div v-for="r in store.resolvedReviews" :key="r.id" class="review resolved">
+          <span class="tag-kind done" :data-kind="r.kind">{{ reviewKindLabel[r.kind] }}</span>
+          <div>
+            <p class="review-msg">{{ r.message }}</p>
+            <p class="review-res">{{ r.resolution }}</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 领号台账 -->
+      <section class="panel ledger-panel">
+        <div class="panel-head">
+          <h2>领号流水台账</h2>
+          <button class="ghost" @click="showLedger = !showLedger">{{ showLedger ? "收起" : "展开" }}</button>
+        </div>
+        <div v-if="showLedger" class="ledger">
+          <div v-for="t in store.tickets" :key="t.id" class="ledger-row" :class="{ unsynced: !t.synced, half: !t.complete }">
+            <span class="tk-id">{{ t.id }}</span>
+            <span class="tk-kind">{{ t.kind }}</span>
+            <span>{{ fmtTime(t.at) }}</span>
+            <span>{{ t.offline ? "断网领取" : "在线领取" }}</span>
+            <span :class="t.synced ? 'sync-yes' : 'sync-no'">{{ t.synced ? "已回传" : "待回传" }}</span>
+            <span v-if="t.basisTicketId" class="basis-line">依据 {{ t.basisTicketId }}</span>
+            <span class="tk-note">{{ t.note }}</span>
+            <span v-if="t.depot" class="depot-line">油库：{{ t.depot.message }}</span>
+            <span v-if="t.errorMsg" class="err-line">{{ t.errorMsg }}</span>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast-wrap">
+      <div v-for="t in store.toasts" :key="t.id" class="toast" :data-type="t.type">{{ t.text }}</div>
     </div>
   </main>
 </template>
